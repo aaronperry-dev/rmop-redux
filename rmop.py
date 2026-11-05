@@ -2325,7 +2325,7 @@ def run_product(src, clim, init, lead, args, eng=None):
     valid = init + timedelta(hours=lead)
     dlat = float(np.median(np.diff(eng.geom.lat))) if len(eng.geom.lat) > 1 else float("nan")
     credit = args.credit or ("RMOP REDUX" + (f" BY {args.credit_name.upper()}" if args.credit_name else "")
-                             + ", AFTER TOTH ET AL. 2001")
+                             + "")
 
     dlon = float(np.median(np.diff(eng.geom.lon))) if len(eng.geom.lon) > 1 else float("nan")
     wrap = bool(np.isfinite(dlon) and (eng.geom.lon[-1] - eng.geom.lon[0] + dlon) >= 359.9)
@@ -2419,7 +2419,7 @@ def run_leads(src, clim, init, a):
         print(f"   FAILED f{L:03d}: {msg}")
     if site and entries:
         credit_text = (f"RMOP Redux" + (f" by {a.credit_name}" if a.credit_name else "")
-                       + " \u00b7 after Toth, Zhu & Marchok (2001)") if not a.credit else a.credit
+                       + ")") if not a.credit else a.credit
         build_site(site, entries, a, init, credit_text, last["nmem"], last["dlat"], leads)
         print(f"\nviewer ready: {os.path.join(site, 'index.html')}"
               f"\n  open it directly, or run:  python3 rmop.py serve {site}")
