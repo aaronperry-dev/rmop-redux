@@ -2259,7 +2259,7 @@ def build_site(site, entries, args, init, credit_text, nmem, dlat, expected=None
     manifest = {
         "title": "Relative Measure of Predictability", "variable": "500 hPa height",
         "model": "NCEP GEFS", "members": nmem, "grid_deg": round(dlat, 4),
-        "method": "RMOP after Toth, Zhu & Marchok (2001)", "credit": credit_text,
+        "method": "", "credit": credit_text,
         "keep_days": args.keep_days, "latest": ordered[0]["init"],
         "image": {"w": iw, "h": ih, "dpi": args.dpi},
         "colors": [{"class": k, "min": 10 * k, "max": 10 * (k + 1), "color": _hex(RMOP_COLORS[k])}
