@@ -1,0 +1,76 @@
+name: RMOP
+
+on:
+  schedule:
+    - cron: "0 8 * * *"          # daily, ~8 UTC; check that the 00Z GEFS cycle is complete by then
+  workflow_dispatch:
+    inputs:
+      init:
+        description: "Init time YYYYMMDDHH (blank = today 00Z)"
+        required: false
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: rmop
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install numpy scipy pillow matplotlib requests eccodes shapely cartopy xarray
+
+      # Rolling cache of the 30-day history, so each daily run only computes the newest day.
+      - name: Restore history cache
+        uses: actions/cache/restore@v4
+        with:
+          path: rmop_cache
+          key: rmop-cache-${{ github.run_id }}
+          restore-keys: rmop-cache-
+
+      - name: Build RMOP site
+        timeout-minutes: 320     # step-level limit so the cache-save step below still runs
+        env:
+          INIT_IN: ${{ inputs.init }}
+        run: |
+          INIT="${INIT_IN:-$(date -u +%Y%m%d)00}"
+          python rmop.py run --init "$INIT" --lead-range 12 240 12 \
+            --climo climo_z500.npz --site site --cache rmop_cache
+
+      - name: Prune cache older than 35 days
+        if: always()
+        run: find rmop_cache -name '*.npz' -mtime +35 -delete 2>/dev/null || true
+
+      - name: Save history cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: rmop_cache
+          key: rmop-cache-${{ github.run_id }}
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
