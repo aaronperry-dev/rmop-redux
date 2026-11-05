@@ -99,8 +99,7 @@ DEPENDENCIES
             (matplotlib supplies contourpy, used for the contour lines)
  for real data : requests, and either `eccodes` or `pygrib` (GRIB2 decoding),
                  xarray + netCDF4/h5netcdf (only for building the climatology)
- optional : cartopy (coastlines); shapely (repairs self-touching contour rings so every
-            exported GeoJSON geometry is strictly valid)
+ optional : cartopy (coastlines)
 
 USAGE
 -----
@@ -115,17 +114,16 @@ USAGE
   # 3) no network / no data needed: synthetic ensemble demo
   python rmop.py demo --out rmop_demo.png
 
-  # 4) full package: hour-slider web viewer + GeoJSON/GeoTIFF layers for GIS
+  # 4) web package: PNG images + dashboard with an hour slider and a 7-day archive
   python rmop.py run --init 2026110300 --lead-range 12 240 12 --climo climo_z500.npz \
                      --site rmop_site
-  #    rmop_site/index.html   hover/tap/drag/keyboard hour slider (opens straight from disk)
-  #    rmop_site/manifest.json machine-readable index of every product
-  #    rmop_site/img/         300 DPI PNGs      rmop_site/web/  web previews
-  #    rmop_site/geo/         rmop_fHHH.geojson (RMOP class polygons), z500_fHHH.geojson
-  #                           (height contours), *.tif (GeoTIFF, EPSG:4326)
-  python rmop.py serve rmop_site --open
-  #    adds the OpenStreetMap / Esri map view and serves the layers over HTTP (CORS on),
-  #    e.g. http://localhost:8000/geo/rmop_f120.geojson for ArcGIS Online, QGIS, Leaflet...
+  #    rmop_site/index.html    dashboard (hover/tap/drag/keyboard hour slider, day + cycle picker;
+  #                            opens straight from disk)
+  #    rmop_site/manifest.json index of every run and hour in the archive
+  #    rmop_site/img/<init>/   rmop_fHHH.png  (300 DPI, 256-colour palette PNG, roughly 0.3-0.5 MB each)
+  #    Run it again for the next cycle: runs already in rmop_site are kept for --keep-days (7) and
+  #    older ones are deleted, so the folder is always the latest week.
+  python rmop.py serve rmop_site --open     # optional local preview over HTTP
 """
 from __future__ import annotations
 
@@ -758,21 +756,25 @@ class Engine:
     def historical(self, init: datetime, lead: int, verify: bool,
                    latest: datetime) -> Optional[Case]:
         path = self._cpath(init, lead) if self.cache_dir else None
-        case = None
+        case, dirty = None, False
         if path and os.path.exists(path):
             z = np.load(path)
             case = Case(init, z["counts"], z["mbin"], z["hit"])
         if case is None:
             _, mbin, cnt = self.current(init, lead)
             case = Case(init, cnt, mbin, np.full(cnt.shape, -1, np.int8))
+            dirty = True
         valid = init + timedelta(hours=lead)
         if verify and valid <= latest and not (case.hit >= 0).any():
             an = self.src.analysis(valid)
             if an is not None:
                 an = self.geom.apply(an)
                 case.hit = is_hit(an, self.cog.edges(valid), case.mbin, self.bins)
-        if path:
-            np.savez_compressed(path, counts=case.counts, mbin=case.mbin, hit=case.hit)
+                dirty = True
+        if path and dirty:                         # only rewrite a cache file when something changed
+            done = bool((case.hit >= 0).any())     # verified: the mean/bin reference is never needed again
+            np.savez_compressed(path, counts=case.counts, hit=case.hit,
+                                mbin=np.zeros(0, case.mbin.dtype) if done else case.mbin)
         return case
 
     def history(self, init: datetime, lead: int, days: int, verify=True,
@@ -1572,13 +1574,29 @@ def _plot_grads_vec(path, slat, slon, pct_sel, z_sel, init, valid, lead, hit_rat
     return _save_rgb(path, np.asarray(fig.canvas.buffer_rgba())[:, :, :3].copy(), dpi)
 
 
+PNG_COLORS = 256          # palette size of the saved PNGs (0 = full-colour RGB); set by --png-colors
+PNG_MAX_ERR = 24         # fall back to full colour if any pixel would shift by more than this (0-255)
+
+
 def _save_rgb(path, rgb, dpi=300):
+    """Save the antialiased image.  The graphic only uses flat colours plus antialiasing blends, so a
+    256-colour palette (no dithering) is visually identical but about 60 % smaller than RGB; the
+    worst-case pixel error is checked and the file falls back to full colour if it is not tiny."""
     from PIL import Image
     im = Image.fromarray(rgb, "RGB")
-    if os.path.splitext(path)[1].lower() == ".gif":
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".gif":
         im.quantize(256).save(path, format="GIF")
     else:
-        im.save(path, format="PNG", dpi=(dpi, dpi))
+        out = im
+        if PNG_COLORS and PNG_COLORS <= 256:
+            q = im.quantize(colors=PNG_COLORS, method=Image.Quantize.MAXCOVERAGE, dither=Image.Dither.NONE)
+            err = int(np.abs(np.asarray(q.convert("RGB"), np.int16) - rgb.astype(np.int16)).max())
+            if err <= PNG_MAX_ERR:
+                out = q
+            else:
+                log.warning("%s: palette error %d > %d, keeping full colour", path, err, PNG_MAX_ERR)
+        out.save(path, format="PNG", dpi=(dpi, dpi), optimize=True)
     log.info("wrote %s (%dx%d px, %d dpi)", path, rgb.shape[1], rgb.shape[0], dpi)
     return rgb
 
@@ -1701,240 +1719,26 @@ def plot_rmop(path, lat, lon, pct, mean_z, init, valid, lead, hit_rates,
 
 
 # ======================================================================
-# 8. GIS export (GeoJSON, GeoTIFF) and web viewer
+# 8. Site export: PNG images, rolling archive and the dashboard viewer
 # ======================================================================
-# GeoJSON follows RFC 7946: WGS84 lon/lat, longitudes within -180..180 (a sector that crosses
-# the antimeridian is cut into pieces there), exterior rings counter-clockwise, holes clockwise.
-# Styling hints use the simplestyle-spec property names that geojson.io, Mapbox, Leaflet
-# plug-ins and ArcGIS Online understand.
+ISO = "%Y-%m-%dT%H:%M:%SZ"
+
+
 def _hex(rgb):
     return "#%02x%02x%02x" % tuple(rgb)
 
 
-def _lon_pieces(lo):
-    """(lon0, lon1, shift) pieces of a sector so every piece lies within -180..180."""
-    out = []
-    if lo[0] < 180.0:
-        out.append((lo[0], min(lo[1], 180.0), 0.0))
-    if lo[1] > 180.0:
-        out.append((max(lo[0], 180.0), lo[1], -360.0))
-    return out
-
-
-def _ring_area(r):
-    x, y = r[:, 0], r[:, 1]
-    return 0.5 * float(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
-
-
-def _dp(P, tol):
-    """Douglas-Peucker simplification of an Nx2 polyline/ring (iterative)."""
-    n = len(P)
-    if n <= 3 or tol <= 0:
-        return P
-    keep = np.zeros(n, bool)
-    keep[0] = keep[-1] = True
-    stack = [(0, n - 1)]
-    while stack:
-        a, b = stack.pop()
-        if b <= a + 1:
-            continue
-        A, d, seg = P[a], P[b] - P[a], P[a + 1:b]
-        L = math.hypot(d[0], d[1])
-        dist = (np.hypot(*(seg - A).T) if L < 1e-12 else
-                np.abs(d[0] * (seg[:, 1] - A[1]) - d[1] * (seg[:, 0] - A[0])) / L)
-        i = int(np.argmax(dist))
-        if dist[i] > tol:
-            k = a + 1 + i
-            keep[k] = True
-            stack += [(a, k), (k, b)]
-    return P[keep]
-
-
-def _fmt(P, shift, nd=3):
-    return np.round(np.column_stack([P[:, 0] + shift, P[:, 1]]), nd).tolist()
-
-
-def _repair_polys(polys):
-    """Make a list of polygons (each [exterior, hole, ...]) strictly valid.  Contour rings can
-    touch themselves at saddle points, which strict GIS software rejects.  Uses shapely when it
-    is installed (pip install shapely); otherwise the polygons are returned unchanged."""
-    try:
-        import shapely
-        from shapely.geometry import MultiPolygon, Polygon
-        from shapely.geometry.polygon import orient
-    except ImportError:
-        return polys
-    g = MultiPolygon([Polygon(r[0], r[1:]) for r in polys])
-    if g.is_valid:
-        return polys
-    g = shapely.set_precision(shapely.make_valid(g), 0.001)
-    parts = list(g.geoms) if hasattr(g, "geoms") else [g]
-    out = []
-    for part in parts:
-        for poly in (list(part.geoms) if part.geom_type == "MultiPolygon" else [part]):
-            if poly.geom_type != "Polygon" or poly.is_empty:
-                continue
-            poly = orient(poly, 1.0)                           # exterior CCW, holes CW
-            out.append([[list(c) for c in poly.exterior.coords]]
-                       + [[list(c) for c in i.coords] for i in poly.interiors])
-    return out
-
-
-def rmop_polygon_features(lat, lon, pct, lo, la, hit_rates, meta, simplify=0.02, min_cells=2):
-    """One MultiPolygon feature per RMOP class (10% steps) from the percentile field."""
-    import contourpy
-    rows = np.where((lat >= la[0] - 1e-6) & (lat <= la[1] + 1e-6))[0]
-    ys = lat[rows]
-    cell = abs(float(np.median(np.diff(lon)))) * abs(float(np.median(np.diff(lat))))
-    min_area = min_cells * cell
-    per_class = [[] for _ in range(N_CLASSES)]
-    for a, b, shift in _lon_pieces(lo):
-        cols = np.where((lon >= a - 1e-6) & (lon <= b + 1e-6))[0]
-        if len(cols) < 2 or len(rows) < 2:
-            continue
-        field = np.asarray(pct, float)[np.ix_(rows, cols)]
-        gen = contourpy.contour_generator(lon[cols], ys, field,
-                                          fill_type=contourpy.FillType.OuterOffset)
-        for k in range(N_CLASSES):
-            pts_list, off_list = gen.filled(10.0 * k, 10.0 * (k + 1) if k < N_CLASSES - 1 else 100.001)
-            for pts, off in zip(pts_list, off_list):
-                rings = []
-                for i in range(len(off) - 1):
-                    r = np.asarray(pts[off[i]:off[i + 1]], float)
-                    if len(r) < 4 or abs(_ring_area(r)) < min_area:
-                        if i == 0:
-                            rings = []
-                            break
-                        continue
-                    r = _dp(r, simplify)
-                    if len(r) < 4:
-                        if i == 0:
-                            rings = []
-                            break
-                        continue
-                    want_ccw = (i == 0)
-                    if (_ring_area(r) > 0) != want_ccw:
-                        r = r[::-1]
-                    rings.append(_fmt(r, shift))
-                if rings:
-                    per_class[k].append(rings)
-    feats = []
-    for k, polys in enumerate(per_class):
-        polys = _repair_polys(polys) if polys else polys
-        if not polys:
-            continue
-        p = None if hit_rates is None or not np.isfinite(hit_rates[k]) else round(float(hit_rates[k]), 1)
-        feats.append({"type": "Feature",
-                      "geometry": {"type": "MultiPolygon", "coordinates": polys},
-                      "properties": {
-                          "layer": "rmop", "rmop_class": k, "rmop_min": 10 * k, "rmop_max": 10 * (k + 1),
-                          "label": f"RMOP {10 * k}-{10 * (k + 1)}%", "probability_pct": p,
-                          "fill": _hex(RMOP_COLORS[k]), "fill-opacity": 0.75, "stroke-width": 0,
-                          **meta}})
-    return feats
-
-
-def z500_line_features(lat, lon, z, lo, la, meta, simplify=0.01):
-    """40 m height contours of the ensemble mean as MultiLineString features."""
-    import contourpy
-    rows = np.where((lat >= la[0] - 1e-6) & (lat <= la[1] + 1e-6))[0]
-    zz = np.asarray(z, float)[rows]
-    levels = np.arange(np.floor(np.nanmin(zz) / 40.0) * 40.0, np.nanmax(zz) + 40.0, 40.0)
-    per = {float(l): [] for l in levels}
-    for a, b, shift in _lon_pieces(lo):
-        cols = np.where((lon >= a - 1e-6) & (lon <= b + 1e-6))[0]
-        if len(cols) < 2:
-            continue
-        gen = contourpy.contour_generator(lon[cols], lat[rows], zz[:, cols],
-                                          line_type=contourpy.LineType.Separate)
-        for l in levels:
-            for ln in gen.lines(l):
-                ln = _dp(np.asarray(ln, float), simplify)
-                if len(ln) >= 2:
-                    per[float(l)].append(_fmt(ln, shift))
-    return [{"type": "Feature", "geometry": {"type": "MultiLineString", "coordinates": lines},
-             "properties": {"layer": "z500", "level_m": int(round(l)), "label": f"{int(round(l))} m",
-                            "stroke": "#111111", "stroke-width": 1.5, "stroke-opacity": 0.95, **meta}}
-            for l, lines in per.items() if lines]
-
-
-def write_geojson(path, features, name, meta):
-    fc = {"type": "FeatureCollection", "name": name, "features": features,
-          "metadata": meta}                                # foreign member (RFC 7946 s6.1)
-    with open(path, "w") as f:
-        json.dump(fc, f, separators=(",", ":"))
-    return os.path.getsize(path)
-
-
-def write_geotiff(path, lat, lon, field, lo, la, description=""):
-    """Single-band float32 GeoTIFF in EPSG:4326 (PixelIsArea, north-up).  Pure Pillow."""
-    from PIL import Image, TiffImagePlugin
-    rows = np.where((lat >= la[0] - 1e-6) & (lat <= la[1] + 1e-6))[0]
-    cols = np.where((lon >= lo[0] - 1e-6) & (lon <= lo[1] + 1e-6))[0]
-    arr = np.asarray(field, np.float32)[np.ix_(rows, cols)][::-1]       # north at the top
-    dy = abs(float(np.median(np.diff(lat))))
-    dx = abs(float(np.median(np.diff(lon))))
-    ifd = TiffImagePlugin.ImageFileDirectory_v2()
-    ifd[33550] = (dx, dy, 0.0)                                              # ModelPixelScale
-    ifd.tagtype[33550] = 12
-    ifd[33922] = (0.0, 0.0, 0.0, float(lon[cols[0]]) - dx / 2, float(lat[rows[-1]]) + dy / 2, 0.0)
-    ifd.tagtype[33922] = 12                                                 # ModelTiepoint
-    ifd[34735] = (1, 1, 0, 3, 1024, 0, 1, 2, 1025, 0, 1, 1, 2048, 0, 1, 4326)   # GeoKeyDirectory
-    ifd.tagtype[34735] = 3
-    if description:
-        ifd[270] = description
-    Image.fromarray(arr).save(path, tiffinfo=ifd, compression="tiff_adobe_deflate")
-    return os.path.getsize(path)
-
-
-def _lead_meta(res):
-    return {"init": f"{res['init']:%Y-%m-%dT%H:%M:%SZ}", "valid": f"{res['valid']:%Y-%m-%dT%H:%M:%SZ}",
-            "lead_hours": res["lead"], "source": "NOAA/NCEP GEFS", "variable": "500 hPa geopotential height",
-            "method": "Relative Measure of Predictability (Toth, Zhu & Marchok 2001)",
-            "members": res["nmem"], "grid_deg": round(res["dlat"], 4)}
+def init_id(init: datetime) -> str:
+    return f"{init:%Y%m%d%H}"
 
 
 def export_lead(site, res, args):
-    """Write the web image and GIS files of one lead into the site folder; return its manifest entry."""
-    from PIL import Image
-    lead = res["lead"]
-    tag = f"f{lead:03d}"
-    lo, la = tuple(args.plot_lon), tuple(args.plot_lat)
-    entry = {"lead": lead, "valid": f"{res['valid']:%Y-%m-%dT%H:%M:%SZ}",
-             "png": os.path.relpath(res["png"], site).replace(os.sep, "/")}
-    web = os.path.join(site, "web", f"rmop_{tag}.webp")
-    with Image.open(res["png"]) as im:
-        im = im.convert("RGB")
-        w = min(args.web_width, im.width)
-        im.resize((w, round(im.height * w / im.width)), Image.LANCZOS).save(web, quality=92, method=5)
-    entry["web"] = f"web/rmop_{tag}.webp"
-    entry["probability"] = None if res["hr"] is None else [None if not np.isfinite(v) else round(float(v), 1)
-                                                            for v in res["hr"]]
-    if not args.no_geo:
-        meta = _lead_meta(res)
-        gdir = os.path.join(site, "geo")
-        pf = rmop_polygon_features(res["lat"], res["lon"], res["pct"], lo, la, res["hr"], meta,
-                                   args.geo_simplify, args.geo_min_cells)
-        zf = z500_line_features(res["lat"], res["lon"], res["mean"], lo, la, meta, args.geo_simplify / 2)
-        entry["geo"] = {"rmop": f"geo/rmop_{tag}.geojson", "z500": f"geo/z500_{tag}.geojson"}
-        entry["bytes"] = {
-            "rmop": write_geojson(os.path.join(gdir, f"rmop_{tag}.geojson"), pf, f"rmop_{tag}", meta),
-            "z500": write_geojson(os.path.join(gdir, f"z500_{tag}.geojson"), zf, f"z500_{tag}", meta)}
-        pieces = _lon_pieces(lo)
-        tifs = {"rmop": [], "z500": []}
-        for pi, (a, b, shift) in enumerate(pieces):
-            suffix = "" if len(pieces) == 1 else f"_p{pi + 1}"
-            for key, fld in (("rmop", res["pct"]), ("z500", res["mean"])):
-                name = f"{key}_{tag}{suffix}.tif"
-                # shift the piece into -180..180 by relabelling its longitudes
-                write_geotiff(os.path.join(gdir, name), res["lat"], res["lon"] + shift, fld,
-                              (a + shift, b + shift), la,
-                              f"{key} {meta['init']} f{lead:03d} {meta['variable']}")
-                tifs[key].append(f"geo/{name}")
-        entry["geotiff"] = tifs
-    return entry
-
-
+    """Manifest entry for one lead; its PNG is already in the site folder."""
+    hr = res["hr"]
+    return {"lead": res["lead"], "valid": res["valid"].strftime(ISO),
+            "png": os.path.relpath(res["png"], site).replace(os.sep, "/"),
+            "probability": None if hr is None else [None if not np.isfinite(v) else round(float(v), 1)
+                                                    for v in hr]}
 
 
 _VIEWER_HTML = r"""<!doctype html>
@@ -1943,75 +1747,83 @@ _VIEWER_HTML = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="light dark">
+<link rel="icon" href="data:,">
 <title>__TITLE__</title>
 <style>
 :root{
   --bg:#f3f5f9; --card:#ffffff; --ink:#0c1424; --muted:#5a6a84; --line:rgba(12,20,36,.09);
-  --accent:#2563eb; --accent-2:#1d4ed8; --on-accent:#fff; --chip:rgba(255,255,255,.78);
+  --accent:#2563eb; --accent-2:#1d4ed8; --on-accent:#fff;
   --shadow:0 1px 2px rgba(12,20,36,.06),0 18px 40px -18px rgba(12,20,36,.28);
   --radius:20px; --hover:rgba(37,99,235,.09);
+  --chrome:300px;               /* page height used by everything except the image */
   font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Inter,Roboto,"Helvetica Neue",Arial,sans-serif;
 }
 @media (prefers-color-scheme:dark){
   :root{--bg:#0a0f1a;--card:#101827;--ink:#e8eefb;--muted:#8fa2c2;--line:rgba(255,255,255,.09);
-    --accent:#5b9dff;--accent-2:#79b0ff;--on-accent:#06101f;--chip:rgba(16,24,39,.74);
+    --accent:#5b9dff;--accent-2:#79b0ff;--on-accent:#06101f;
     --shadow:0 1px 2px rgba(0,0,0,.5),0 22px 48px -20px rgba(0,0,0,.7);--hover:rgba(91,157,255,.14)}
 }
 *{box-sizing:border-box}
 html{-webkit-text-size-adjust:100%}
 body{margin:0;background:var(--bg);color:var(--ink);line-height:1.45;
   background-image:radial-gradient(1200px 500px at 50% -10%,color-mix(in srgb,var(--accent) 10%,transparent),transparent 70%)}
-.app{max-width:1180px;margin:0 auto;padding:clamp(14px,3vw,32px) clamp(12px,3vw,28px) 40px}
-.top{display:flex;flex-wrap:wrap;gap:14px 24px;align-items:flex-end;justify-content:space-between;margin-bottom:18px}
-.top h1{margin:0;font-size:clamp(20px,3.2vw,30px);letter-spacing:-.02em;font-weight:720}
-.top p{margin:4px 0 0;color:var(--muted);font-size:14px}
-.seg{display:inline-flex;padding:4px;border-radius:14px;background:color-mix(in srgb,var(--ink) 7%,transparent);gap:2px}
-.seg button{all:unset;cursor:pointer;padding:8px 16px;border-radius:10px;font-size:14px;font-weight:600;color:var(--muted);
-  transition:background .18s,color .18s,box-shadow .18s}
+.app{max-width:1180px;margin:0 auto;padding:clamp(12px,2.4vw,26px) clamp(12px,3vw,28px) 36px}
+.top{display:flex;flex-wrap:wrap;gap:10px 24px;align-items:flex-end;justify-content:space-between;margin-bottom:14px}
+.top h1{margin:0;font-size:clamp(19px,2.8vw,27px);letter-spacing:-.02em;font-weight:720}
+.top p{margin:3px 0 0;color:var(--muted);font-size:13.5px}
+.runs{display:flex;flex-wrap:wrap;gap:8px}
+.seg{display:inline-flex;flex-wrap:wrap;padding:3px;border-radius:13px;background:color-mix(in srgb,var(--ink) 7%,transparent);gap:2px}
+.seg button{all:unset;cursor:pointer;padding:7px 12px;border-radius:10px;font-size:13.5px;font-weight:600;color:var(--muted);
+  font-variant-numeric:tabular-nums;white-space:nowrap;transition:background .18s,color .18s,box-shadow .18s}
+.seg button:hover:not(:disabled){color:var(--ink)}
 .seg button[aria-pressed=true]{background:var(--card);color:var(--ink);box-shadow:0 1px 3px rgba(0,0,0,.18)}
+.seg button:disabled{opacity:.35;cursor:default}
 .seg button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 .card{background:var(--card);border-radius:var(--radius);box-shadow:var(--shadow);border:1px solid var(--line)}
-.viewport{position:relative;overflow:hidden;background:#fff;border-top:1px solid var(--line);border-bottom:1px solid var(--line);
-  aspect-ratio:var(--ar,1.275);isolation:isolate}
+.stage{background:color-mix(in srgb,var(--ink) 4%,var(--card));border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
+/* the image is as large as fits in the window height (never taller than the screen) and never wider than the card */
+.viewport{position:relative;overflow:hidden;background:#fff;margin:0 auto;isolation:isolate;aspect-ratio:var(--ar,1.275);
+  width:min(100%,max(340px,calc((100vh - var(--chrome)) * var(--ar,1.275))));
+  width:min(100%,max(340px,calc((100dvh - var(--chrome)) * var(--ar,1.275))))}
 .layer{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;opacity:0;transition:opacity .2s ease;
   user-select:none;-webkit-user-drag:none}
 .layer.on{opacity:1}
-#map{position:absolute;inset:0;z-index:2}
 .skeleton{position:absolute;inset:0;z-index:3;background:linear-gradient(100deg,transparent 30%,rgba(125,140,165,.22) 50%,transparent 70%) 0 0/200% 100%,
   color-mix(in srgb,var(--ink) 5%,var(--card));animation:sh 1.3s linear infinite;transition:opacity .3s}
 .skeleton.done{opacity:0;pointer-events:none}
 @keyframes sh{to{background-position:-200% 0}}
-.bar{display:flex;align-items:center;gap:14px;padding:12px clamp(12px,2vw,20px);flex-wrap:wrap}
+.bar{display:flex;align-items:center;gap:14px;padding:10px clamp(12px,2vw,20px);flex-wrap:wrap}
 .now{flex:1;min-width:150px;display:flex;flex-wrap:wrap;align-items:baseline;gap:0 12px}
-.now b{font-size:clamp(19px,3vw,24px);letter-spacing:-.02em;font-variant-numeric:tabular-nums}
+.now b{font-size:clamp(18px,2.8vw,23px);letter-spacing:-.02em;font-variant-numeric:tabular-nums}
 .now span{color:var(--muted);font-size:14px;font-weight:550}
-.toast{position:absolute;inset:auto 14px 64px 14px;z-index:6;max-width:520px;padding:12px 14px;border-radius:14px;background:var(--card);
-  border:1px solid var(--line);box-shadow:var(--shadow);font-size:13.5px;display:none}
-.toast.show{display:block}.toast code{background:color-mix(in srgb,var(--ink) 8%,transparent);padding:2px 6px;border-radius:6px}
-.controls{padding:14px clamp(12px,2vw,20px) 18px}
-.play{all:unset;cursor:pointer;flex:none;width:42px;height:42px;border-radius:50%;display:grid;place-items:center;background:var(--accent);color:var(--on-accent);
+.tag{font-size:12.5px;font-weight:650;color:var(--muted);padding:5px 10px;border-radius:999px;background:color-mix(in srgb,var(--ink) 6%,transparent);white-space:nowrap}
+.tag.latest{color:var(--accent-2);background:color-mix(in srgb,var(--accent) 13%,transparent)}
+.tag.warn{color:#8a5a00;background:rgba(245,166,35,.2)}
+@media (prefers-color-scheme:dark){.tag.warn{color:#ffc766;background:rgba(245,166,35,.18)}}
+.update{all:unset;cursor:pointer;position:fixed;left:50%;bottom:18px;transform:translateX(-50%);z-index:20;max-width:calc(100vw - 24px);
+  padding:11px 18px;border-radius:999px;background:var(--accent);color:var(--on-accent);font-size:14px;font-weight:650;
+  box-shadow:0 14px 34px -10px rgba(0,0,0,.45);text-align:center}
+.update[hidden]{display:none}
+.update:hover{filter:brightness(1.08)}.update:focus-visible{outline:2px solid var(--ink);outline-offset:3px}
+.controls{padding:12px clamp(12px,2vw,20px) 16px}
+.play{all:unset;cursor:pointer;flex:none;width:40px;height:40px;border-radius:50%;display:grid;place-items:center;background:var(--accent);color:var(--on-accent);
   box-shadow:0 8px 18px -8px var(--accent);transition:transform .15s,filter .15s}
 .play:hover{filter:brightness(1.08)}.play:active{transform:scale(.94)}
 .play:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
 .play svg{width:18px;height:18px;fill:currentColor}
 .play .i-pause{display:none}.play[aria-pressed=true] .i-play{display:none}.play[aria-pressed=true] .i-pause{display:block}
-.progress{height:3px;border-radius:3px;background:color-mix(in srgb,var(--ink) 9%,transparent);margin:0 2px 10px;overflow:hidden}
+.progress{height:3px;border-radius:3px;background:color-mix(in srgb,var(--ink) 9%,transparent);margin:0 2px 9px;overflow:hidden}
 .progress i{display:block;height:100%;background:var(--accent);transform-origin:left;transform:scaleX(var(--p,0));transition:transform .25s cubic-bezier(.2,.8,.2,1)}
-.rail{display:grid;grid-template-columns:repeat(auto-fit,minmax(60px,1fr));gap:6px;touch-action:none;user-select:none;-webkit-user-select:none}
-.rail button{all:unset;box-sizing:border-box;cursor:pointer;text-align:center;padding:9px 4px 8px;border-radius:12px;display:grid;gap:1px;
+.rail{display:grid;grid-template-columns:repeat(auto-fit,minmax(58px,1fr));gap:5px;touch-action:none;user-select:none;-webkit-user-select:none}
+.rail button{all:unset;box-sizing:border-box;cursor:pointer;text-align:center;padding:8px 4px 7px;border-radius:12px;display:grid;gap:1px;position:relative;
   transition:background .15s,color .15s,transform .18s cubic-bezier(.2,.8,.2,1),box-shadow .18s;-webkit-tap-highlight-color:transparent}
 .rail button b{font-size:14px;letter-spacing:-.01em;font-variant-numeric:tabular-nums}
 .rail button small{font-size:11px;color:var(--muted);font-variant-numeric:tabular-nums;white-space:nowrap}
-.rail button{position:relative}
 .rail button.day::before{content:"";position:absolute;left:-4px;top:18%;bottom:18%;width:1px;background:color-mix(in srgb,var(--ink) 16%,transparent)}
 .rail button:hover{background:var(--hover)}
 .rail button[aria-selected=true]{background:var(--accent);color:var(--on-accent);transform:translateY(-1px) scale(1.04);box-shadow:0 10px 20px -10px var(--accent)}
 .rail button[aria-selected=true] small{color:inherit;opacity:.85}
 .rail button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
-.tools{display:none;align-items:center;gap:14px;padding:0 clamp(12px,2vw,20px) 16px;font-size:13.5px;color:var(--muted)}
-.tools.show{display:flex;flex-wrap:wrap}
-.tools label{display:flex;align-items:center;gap:8px}
-.tools input[type=range]{accent-color:var(--accent);width:160px}
 .grid{display:grid;gap:16px;margin-top:18px;grid-template-columns:repeat(auto-fit,minmax(260px,1fr))}
 .tile{padding:16px 18px}
 .tile h2{margin:0 0 8px;font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);font-weight:700}
@@ -2022,10 +1834,10 @@ body{margin:0;background:var(--bg);color:var(--ink);line-height:1.45;
 .legend div{display:flex;align-items:center;gap:8px}.legend i{width:16px;height:16px;border-radius:5px;border:1px solid var(--line);flex:none}
 footer{margin-top:22px;color:var(--muted);font-size:12.5px;text-align:center}
 kbd{font:inherit;font-size:11.5px;padding:1px 6px;border-radius:6px;border:1px solid var(--line);background:color-mix(in srgb,var(--ink) 5%,transparent)}
-.leaflet-container{font:inherit;background:#cfd8e6}
 @media (max-width:640px){
   .rail{grid-template-columns:repeat(5,1fr)}.rail button small{font-size:10.5px}
-  .bar{gap:10px}.seg{margin-left:auto}
+  .bar{gap:10px}.runs{width:100%}
+  :root{--chrome:360px}
 }
 @media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
 </style>
@@ -2034,6 +1846,10 @@ kbd{font:inherit;font-size:11.5px;padding:1px 6px;border-radius:6px;border:1px s
 <main class="app">
   <header class="top">
     <div><h1 id="title"></h1><p id="subtitle"></p></div>
+    <div class="runs" aria-label="Model run">
+      <div class="seg" id="days" role="group" aria-label="Day (UTC)"></div>
+      <div class="seg" id="cycles" role="group" aria-label="Cycle (UTC)"></div>
+    </div>
   </header>
 
   <section class="card" aria-label="Forecast viewer">
@@ -2043,93 +1859,131 @@ kbd{font:inherit;font-size:11.5px;padding:1px 6px;border-radius:6px;border:1px s
         <svg class="i-pause" viewBox="0 0 24 24"><rect x="6.5" y="5" width="4" height="14" rx="1.2"/><rect x="13.5" y="5" width="4" height="14" rx="1.2"/></svg>
       </button>
       <div class="now" aria-live="polite"><b id="chipLead"></b><span id="chipValid"></span></div>
-      <div class="seg" role="group" aria-label="View">
-        <button id="vGraphic" aria-pressed="true">Graphic</button>
-        <button id="vMap" aria-pressed="false">Map</button>
-      </div>
+      <span class="tag" id="runTag"></span>
     </div>
-    <div class="viewport" id="viewport">
-      <img id="imgA" class="layer" alt="" draggable="false" decoding="async">
-      <img id="imgB" class="layer" alt="" draggable="false" decoding="async">
-      <div id="map" hidden></div>
-      <div class="skeleton" id="skeleton"></div>
-      <div class="toast" id="toast"></div>
+    <div class="stage">
+      <div class="viewport" id="viewport">
+        <img id="imgA" class="layer" alt="" draggable="false" decoding="async">
+        <img id="imgB" class="layer" alt="" draggable="false" decoding="async">
+        <div class="skeleton" id="skeleton"></div>
+      </div>
     </div>
     <div class="controls">
       <div class="progress" aria-hidden="true"><i id="prog"></i></div>
       <div class="rail" id="rail" role="listbox" aria-label="Forecast hour"></div>
     </div>
-    <div class="tools" id="mapTools">
-      <label>Layer opacity <input type="range" id="opacity" min="10" max="100" value="75" aria-label="RMOP layer opacity"></label>
-      <label><input type="checkbox" id="contours" checked> Height contours</label>
-    </div>
   </section>
 
   <div class="grid">
-    <section class="card tile"><h2>Download this hour</h2><ul id="links"></ul></section>
+    <section class="card tile"><h2>Download this image</h2><ul id="links"></ul></section>
     <section class="card tile"><h2>RMOP scale</h2><div class="legend" id="legend"></div>
       <p style="margin-top:10px"><small>Colours show how many ensemble members agree with the ensemble mean, relative to recent forecasts.</small></p></section>
     <section class="card tile"><h2>About</h2><p id="about"></p>
-      <p style="margin-top:8px"><small>Hover or tap an hour. <kbd>←</kbd> <kbd>→</kbd> step, <kbd>Space</kbd> plays.</small></p></section>
+      <p style="margin-top:8px"><small>Hover or tap an hour. <kbd>←</kbd> <kbd>→</kbd> step hours, <kbd>[</kbd> <kbd>]</kbd> older / newer run, <kbd>Space</kbd> plays.</small></p></section>
   </div>
   <footer id="credit"></footer>
 </main>
+<button class="update" id="update" hidden></button>
 <noscript><p style="padding:20px">This viewer needs JavaScript.</p></noscript>
 
 <script type="application/json" id="manifest">__MANIFEST__</script>
 <script>
 "use strict";
-const M = JSON.parse(document.getElementById("manifest").textContent);
+let M = JSON.parse(document.getElementById("manifest").textContent);
 const $ = id => document.getElementById(id);
-const items = M.leads;
-const fmtDay = (iso, opts) => new Date(iso).toLocaleString("en-US", {timeZone: "UTC", ...opts});
-const dayName = iso => fmtDay(iso, {weekday: "short"});
-const hourZ = iso => fmtDay(iso, {hour: "2-digit", hour12: false}) + "Z";
-const longValid = iso => `${fmtDay(iso, {weekday: "short", day: "2-digit", month: "short"})} ${hourZ(iso)}`;
+let runs = M.inits;                                     // newest first
+const isComplete = r => r.complete !== false;           // every planned forecast hour was produced
+const defaultIdx = rs => { const k = rs.findIndex(isComplete); return k < 0 ? 0 : k; };
+let latestIdx = defaultIdx(runs);                       // newest COMPLETE run = what the page opens on
+const fmt = (iso, o) => new Date(iso).toLocaleString("en-US", {timeZone: "UTC", ...o});
+const dayName = iso => fmt(iso, {weekday: "short"});
+const hourZ = iso => iso.slice(11, 13) + "Z";
+const dayKey = iso => iso.slice(0, 10), cycKey = iso => iso.slice(11, 13);
+const longValid = iso => `${fmt(iso, {weekday: "short", day: "2-digit", month: "short"})} ${hourZ(iso)}`;
+const pad3 = n => String(n).padStart(3, "0");
+
+let runIdx = latestIdx, items = runs[latestIdx].leads, run = runs[latestIdx], cur = -1, front, token = 0;
 
 /* ---------- static content ---------- */
 $("title").textContent = M.title;
-$("subtitle").textContent = `${M.variable} · ${M.model} · initialized ${fmtDay(M.init, {day: "2-digit", month: "short", year: "numeric"})} ${hourZ(M.init)}`;
-$("about").textContent = `${M.members} ensemble members on a ${M.grid_deg}° grid. ${M.method}.`;
 $("credit").textContent = M.credit;
 document.documentElement.style.setProperty("--ar", M.image.w / M.image.h);
 M.colors.forEach(c => { const d = document.createElement("div"); d.innerHTML = `<i style="background:${c.color}"></i>${c.min}–${c.max}%`; $("legend").appendChild(d); });
 
-const rail = $("rail");
-items.forEach((it, i) => {
-  const b = document.createElement("button");
-  b.type = "button"; b.dataset.i = i; b.setAttribute("role", "option");
-  b.innerHTML = `<b>+${it.lead}h</b><small>${dayName(it.valid)} ${hourZ(it.valid)}</small>`;
-  if (i > 0 && fmtDay(it.valid, {day: "2-digit"}) !== fmtDay(items[i - 1].valid, {day: "2-digit"})) b.classList.add("day");
-  b.title = `+${it.lead} h — valid ${longValid(it.valid)}`;
-  rail.appendChild(b);
+/* ---------- run picker (day + cycle) ---------- */
+const findRun = (d, c) => runs.findIndex(r => dayKey(r.init) === d && cycKey(r.init) === c);
+function buildPickers() {
+  const days = [...new Set(runs.map(r => dayKey(r.init)))].sort();          // oldest -> newest
+  const cycles = [...new Set(runs.map(r => cycKey(r.init)))].sort();
+  $("days").textContent = ""; $("cycles").textContent = "";
+  days.forEach(d => {
+    const b = document.createElement("button"), iso = d + "T00:00:00Z";
+    b.type = "button"; b.dataset.day = d; b.textContent = `${dayName(iso)} ${fmt(iso, {day: "numeric"})}`;
+    b.title = fmt(iso, {weekday: "long", day: "numeric", month: "long", year: "numeric"}) + " (UTC)";
+    $("days").appendChild(b);
+  });
+  cycles.forEach(c => {
+    const b = document.createElement("button");
+    b.type = "button"; b.dataset.cyc = c; b.textContent = c + "Z"; b.title = `${c}Z model cycle`;
+    $("cycles").appendChild(b);
+  });
+}
+buildPickers();
+$("days").addEventListener("click", e => {
+  const b = e.target.closest("button"); if (!b) return;
+  const d = b.dataset.day;
+  let k = findRun(d, cycKey(run.init));                                    // same cycle if that day has it ...
+  if (k < 0) k = runs.findIndex(r => dayKey(r.init) === d);                // ... else its newest run
+  if (k >= 0) { pausePlay(); selectRun(k); }
 });
-const btns = [...rail.children];
+$("cycles").addEventListener("click", e => {
+  const b = e.target.closest("button"); if (!b || b.disabled) return;
+  const k = findRun(dayKey(run.init), b.dataset.cyc);
+  if (k >= 0) { pausePlay(); selectRun(k); }
+});
+
+/* ---------- forecast-hour rail ---------- */
+const rail = $("rail");
+let btns = [];
+function buildRail() {
+  rail.textContent = "";
+  items.forEach((it, i) => {
+    const b = document.createElement("button");
+    b.type = "button"; b.dataset.i = i; b.setAttribute("role", "option");
+    b.innerHTML = `<b>+${it.lead}h</b><small>${dayName(it.valid)} ${hourZ(it.valid)}</small>`;
+    if (i > 0 && dayKey(it.valid) !== dayKey(items[i - 1].valid)) b.classList.add("day");
+    b.title = `+${it.lead} h — valid ${longValid(it.valid)}`;
+    rail.appendChild(b);
+  });
+  btns = [...rail.children];
+}
 
 /* ---------- image layers (two-layer crossfade, decode before swap) ---------- */
 const A = $("imgA"), B = $("imgB");
-let front = A, cur = -1, token = 0, view = "graphic";
+front = A;
 async function showImage(i) {
   const t = ++token, next = front === A ? B : A;
-  next.alt = `RMOP ${items[i].lead}-hour forecast`;
-  next.src = items[i].web;
+  next.alt = `RMOP ${items[i].lead}-hour forecast, run ${run.id}`;
+  next.src = items[i].png;
   try { await next.decode(); } catch (e) { /* missing file: show nothing rather than throw */ }
-  if (t !== token) return;                       // a newer hover won the race
+  if (t !== token) return;                              // a newer hover won the race
   next.classList.add("on"); front.classList.remove("on"); front = next;
   $("skeleton").classList.add("done");
 }
 const warmed = new Set();
-function warm(i) { if (i < 0 || i >= items.length || warmed.has(i)) return; warmed.add(i);
-  const im = new Image(); im.decoding = "async"; im.src = items[i].web; }
-function warmAround(i) {                         // nearest hours first, then the rest while idle
+function warm(url) { if (warmed.has(url)) return; warmed.add(url);
+  const im = new Image(); im.decoding = "async"; im.src = url; }
+function warmAround(i) {                                // neighbours now, the rest of this run while idle
   const order = items.map((_, k) => k).sort((a, b) => Math.abs(a - i) - Math.abs(b - i));
-  order.slice(0, 3).forEach(warm);
-  const rest = order.slice(3), step = () => { const k = rest.shift(); if (k === undefined) return; warm(k);
-    (window.requestIdleCallback || (f => setTimeout(f, 60)))(step); };
-  (window.requestIdleCallback || (f => setTimeout(f, 200)))(step);
+  order.slice(0, 3).forEach(k => warm(items[k].png));
+  if (navigator.connection && navigator.connection.saveData) return;
+  const rest = order.slice(3), step = () => { const k = rest.shift(); if (k === undefined) return; warm(items[k].png);
+    (window.requestIdleCallback || (f => setTimeout(f, 80)))(step); };
+  (window.requestIdleCallback || (f => setTimeout(f, 250)))(step);
 }
 
 /* ---------- selection ---------- */
+const hashFor = it => (runIdx === latestIdx ? "" : run.id + "-") + "f" + pad3(it.lead);
 function select(i, opts = {}) {
   i = Math.max(0, Math.min(items.length - 1, i));
   if (i === cur && !opts.force) return;
@@ -2138,21 +1992,38 @@ function select(i, opts = {}) {
   $("prog").style.setProperty("--p", items.length > 1 ? i / (items.length - 1) : 1);
   $("chipLead").textContent = `+${it.lead} h`;
   $("chipValid").textContent = `valid ${longValid(it.valid)}`;
-  renderLinks(it);
-  if (view === "graphic") showImage(i); else renderMap(i);
-  if (!opts.noHash) history.replaceState(null, "", "#f" + String(it.lead).padStart(3, "0"));
+  $("links").innerHTML = `<li><a href="${it.png}" download="rmop_${run.id}_f${pad3(it.lead)}.png">PNG <small>(+${it.lead} h, run ${run.id})</small></a></li>`;
+  showImage(i);
+  if (!opts.noHash) history.replaceState(null, "", "#" + hashFor(it));
   if (!opts.noWarm) warmAround(i);
 }
-function renderLinks(it) {
-  const li = [];
-  li.push(`<li><a href="${it.png}" download>Full-resolution PNG <small>(300 DPI)</small></a></li>`);
-  if (it.geo) {
-    li.push(`<li><a href="${it.geo.rmop}" download>GeoJSON — RMOP polygons</a></li>`);
-    li.push(`<li><a href="${it.geo.z500}" download>GeoJSON — 500 hPa contours</a></li>`);
+function selectRun(k, opts = {}) {
+  k = Math.max(0, Math.min(runs.length - 1, k));
+  const prevLead = cur >= 0 ? items[cur].lead : null;
+  runIdx = k; run = runs[k]; items = run.leads;
+  const d = dayKey(run.init), c = cycKey(run.init);
+  [...$("days").children].forEach(b => b.setAttribute("aria-pressed", b.dataset.day === d));
+  [...$("cycles").children].forEach(b => { const j = findRun(d, b.dataset.cyc);
+    b.setAttribute("aria-pressed", b.dataset.cyc === c); b.disabled = j < 0;
+    b.title = `${b.dataset.cyc}Z model cycle` + (j >= 0 && !isComplete(runs[j]) ? " (partial)" : ""); });
+  $("subtitle").textContent = `${M.variable} · ${M.model} · initialized ${fmt(run.init, {weekday: "short", day: "2-digit", month: "short", year: "numeric"})} ${hourZ(run.init)}`;
+  const tag = $("runTag"), nExp = (run.expected || []).length;
+  let label = k === latestIdx ? "Latest run" : k < latestIdx ? "Newer run, still partial"
+            : `Archive · ${fmt(run.init, {day: "2-digit", month: "short"})} ${hourZ(run.init)}`;
+  if (!isComplete(run)) label += ` (${items.length}/${nExp} hrs)`;
+  tag.textContent = label;
+  tag.classList.toggle("latest", k === latestIdx && isComplete(run));
+  tag.classList.toggle("warn", !isComplete(run));
+  $("about").textContent = `${run.members || M.members} ensemble members on a ${M.grid_deg}° grid. ${M.method}. ` +
+    `Showing the ${runs.length} most recent runs (past ${M.keep_days} days).`;
+  buildRail();
+  let i = opts.leadIndex;
+  if (i == null) {                                      // keep the same forecast hour when the new run has it
+    i = 0;
+    if (prevLead != null) { let best = Infinity; items.forEach((it, j) => { const dd = Math.abs(it.lead - prevLead); if (dd < best) { best = dd; i = j; } }); }
   }
-  if (it.geotiff) it.geotiff.rmop.forEach((p, k, a) => li.push(`<li><a href="${p}" download>GeoTIFF — RMOP field${a.length > 1 ? ` (part ${k + 1})` : ""}</a></li>`));
-  li.push(`<li><a href="manifest.json">manifest.json <small>(all hours)</small></a></li>`);
-  $("links").innerHTML = li.join("");
+  cur = -1;
+  select(i, {force: true, noHash: opts.noHash});
 }
 
 /* ---------- hover / tap / drag / keyboard ---------- */
@@ -2174,141 +2045,155 @@ document.addEventListener("keydown", e => {
   else if (k === "ArrowLeft" || k === "ArrowUp") { e.preventDefault(); pausePlay(); select(cur - 1); btns[cur].focus({preventScroll: true}); }
   else if (k === "Home") { e.preventDefault(); select(0); btns[0].focus({preventScroll: true}); }
   else if (k === "End") { e.preventDefault(); select(items.length - 1); btns[cur].focus({preventScroll: true}); }
+  else if (k === "[") { e.preventDefault(); pausePlay(); selectRun(runIdx + 1); }      // older run
+  else if (k === "]") { e.preventDefault(); pausePlay(); selectRun(runIdx - 1); }      // newer run (may be partial)
   else if (k === " " && e.target.tagName !== "BUTTON") { e.preventDefault(); togglePlay(); }
 });
 
 /* ---------- autoplay ---------- */
 let timer = null;
-const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
 function togglePlay() { timer ? pausePlay() : startPlay(); }
 function startPlay() { if (timer) return; $("play").setAttribute("aria-pressed", "true");
-  timer = setInterval(() => select(cur >= items.length - 1 ? 0 : cur + 1), view === "map" ? 1400 : 800); }
+  timer = setInterval(() => select(cur >= items.length - 1 ? 0 : cur + 1), 800); }
 function pausePlay() { if (!timer) return; clearInterval(timer); timer = null; $("play").setAttribute("aria-pressed", "false"); }
 $("play").addEventListener("click", togglePlay);
 
-/* ---------- map view (Leaflet, loaded on demand) ---------- */
-let map = null, geoCache = new Map(), layers = {rmop: null, z500: null}, mapToken = 0;
-const toast = msg => { const t = $("toast"); t.innerHTML = msg; t.classList.add("show"); };
-const untoast = () => $("toast").classList.remove("show");
-function loadLeaflet() {
-  if (window.L) return Promise.resolve();
-  return new Promise((res, rej) => {
-    const css = document.createElement("link"); css.rel = "stylesheet";
-    css.href = "https://unpkg.com/leaflet@1.9.4/dist/leaflet.css";
-    css.integrity = "sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="; css.crossOrigin = "";
-    document.head.appendChild(css);
-    const js = document.createElement("script");
-    js.src = "https://unpkg.com/leaflet@1.9.4/dist/leaflet.js";
-    js.integrity = "sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="; js.crossOrigin = "";
-    js.onload = res; js.onerror = () => rej(new Error("Leaflet could not be loaded (are you online?)"));
-    document.head.appendChild(js);
-  });
-}
-const getGeo = url => { if (!geoCache.has(url)) geoCache.set(url, fetch(url).then(r => { if (!r.ok) throw new Error(url + " → " + r.status); return r.json(); })); return geoCache.get(url); };
-async function ensureMap() {
-  if (map) return;
-  await loadLeaflet();
-  const osm = L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {maxZoom: 19,
-    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'});
-  const esri = L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}", {maxZoom: 19,
-    attribution: "Tiles &copy; Esri &mdash; Source: Esri, Maxar, Earthstar Geographics, and the GIS User Community"});
-  map = L.map("map", {preferCanvas: true, zoomSnap: 0.25, layers: [osm]});
-  L.control.layers({"OpenStreetMap": osm, "Esri World Imagery": esri}, {}, {collapsed: true}).addTo(map);
-  const b = M.bounds; map.fitBounds([[b.lat[0], b.lon[0]], [b.lat[1], b.lon[1]]], {padding: [10, 10]});
-  window.rmopMap = map;
-}
-const toLatLng = c => L.latLng(c[1], (M.wrap360 && c[0] < 0) ? c[0] + 360 : c[0]);
-async function renderMap(i) {
-  const t = ++mapToken, it = items[i];
-  if (!it.geo) { toast("This site was built without GIS layers (<code>--no-geo</code>)."); return; }
-  try {
-    await ensureMap(); map.invalidateSize();
-    const [pg, zg] = await Promise.all([getGeo(it.geo.rmop), getGeo(it.geo.z500)]);
-    if (t !== mapToken) return;
-    untoast();
-    const op = $("opacity").value / 100, canvas = L.canvas({padding: 0.4});
-    const newR = L.geoJSON(pg, {coordsToLatLng: toLatLng, renderer: canvas,
-      style: f => ({stroke: false, fillColor: f.properties.fill, fillOpacity: op}),
-      onEachFeature: (f, l) => { const p = f.properties.probability_pct;
-        l.bindTooltip(`${f.properties.label}${p == null ? "" : ` · verified ${p}%`}`, {sticky: true}); }});
-    const newZ = L.geoJSON(zg, {coordsToLatLng: toLatLng, renderer: canvas, interactive: false,
-      style: {color: "#111", weight: 1.4, opacity: 0.9}});
-    ["rmop", "z500"].forEach(k => layers[k] && map.removeLayer(layers[k]));
-    layers = {rmop: newR.addTo(map), z500: $("contours").checked ? newZ.addTo(map) : newZ};
-    window.rmopLayerInfo = {lead: it.lead, rmop: Object.keys(newR._layers).length, z500: Object.keys(newZ._layers).length};
-    [i - 1, i + 1].forEach(k => items[k] && items[k].geo && (getGeo(items[k].geo.rmop).catch(() => {}), getGeo(items[k].geo.z500).catch(() => {})));
-  } catch (err) {
-    const local = location.protocol === "file:";
-    toast(local ? `The map view loads GIS layers over HTTP. Run <code>python3 rmop.py serve ${M.site_hint}</code> and open <code>http://localhost:8000</code>.`
-                : `Map view unavailable: ${err.message}`);
-  }
-}
-$("opacity").addEventListener("input", () => layers.rmop && layers.rmop.setStyle({fillOpacity: $("opacity").value / 100}));
-$("contours").addEventListener("change", () => { if (!layers.z500 || !map) return;
-  $("contours").checked ? layers.z500.addTo(map) : map.removeLayer(layers.z500); });
-function setView(v) {
-  view = v; const g = v === "graphic";
-  $("vGraphic").setAttribute("aria-pressed", g); $("vMap").setAttribute("aria-pressed", !g);
-  A.parentElement.querySelectorAll(".layer").forEach(el => el.style.visibility = g ? "" : "hidden");
-  $("map").hidden = g; $("mapTools").classList.toggle("show", !g); untoast();
-  $("skeleton").classList.toggle("done", g ? $("skeleton").classList.contains("done") : true);
-  if (timer) { pausePlay(); startPlay(); }
-  select(cur, {force: true, noWarm: true});
-}
-$("vGraphic").addEventListener("click", () => setView("graphic"));
-$("vMap").addEventListener("click", () => setView("map"));
-
 /* ---------- boot ---------- */
-function fromHash() { const m = /^#f?(\d+)$/.exec(location.hash); if (!m) return 0;
-  const k = items.findIndex(it => it.lead === +m[1]); return k < 0 ? 0 : k; }
-window.addEventListener("hashchange", () => select(fromHash(), {noHash: true}));
-window.rmopViewer = {select, items, get state() { return {cur, view, playing: !!timer}; }};
-select(fromHash(), {force: true, noHash: location.hash === ""});
+// #f060 = latest run, +60 h        #2026110418-f060 = the 18Z run of 4 Nov 2026, +60 h
+function fromHash() {
+  const m = /^#(?:(\d{10})[-\/])?f?(\d+)$/.exec(location.hash);
+  if (!m) return {run: latestIdx, lead: null};
+  const k = m[1] ? runs.findIndex(r => r.id === m[1]) : latestIdx;
+  return {run: k < 0 ? latestIdx : k, lead: +m[2]};
+}
+function applyHash(noHash) {
+  const h = fromHash(), r = runs[h.run];
+  const j = h.lead == null ? -1 : r.leads.findIndex(it => it.lead === h.lead);
+  selectRun(h.run, {leadIndex: j < 0 ? 0 : j, noHash});
+}
+window.addEventListener("hashchange", () => { const h = fromHash(), r = runs[h.run];
+  const j = h.lead == null ? 0 : Math.max(0, r.leads.findIndex(it => it.lead === h.lead));
+  if (h.run !== runIdx) selectRun(h.run, {leadIndex: j, noHash: true}); else select(j, {noHash: true}); });
+/* ---------- pick up new runs without a reload ---------- */
+// A key that changes when a newer run appears, or the newest run gains hours / becomes the newest complete one.
+const keyOf = rs => `${rs[0].id}:${rs[0].leads.length}|${rs[defaultIdx(rs)].id}`;
+let pending = null;
+async function checkForUpdate() {
+  if (location.protocol === "file:") return;            // nothing to fetch when opened from disk
+  try {
+    const r = await fetch("manifest.json?t=" + Date.now(), {cache: "no-store"});
+    if (!r.ok) return;
+    const nm = await r.json();
+    if (!nm || !Array.isArray(nm.inits) || !nm.inits.length || keyOf(nm.inits) === keyOf(runs)) return;
+    pending = nm;
+    const nr = nm.inits[defaultIdx(nm.inits)];
+    $("update").textContent = `New run available · ${fmt(nr.init, {weekday: "short", day: "2-digit", month: "short"})} ${hourZ(nr.init)} — load`;
+    $("update").hidden = false;
+  } catch (e) { /* offline or mid-deploy: try again later */ }
+}
+$("update").addEventListener("click", () => {
+  if (!pending) return;
+  M = pending; pending = null; runs = M.inits; latestIdx = defaultIdx(runs);
+  document.documentElement.style.setProperty("--ar", M.image.w / M.image.h);
+  $("credit").textContent = M.credit;
+  buildPickers(); $("update").hidden = true; pausePlay();
+  selectRun(latestIdx);
+});
+setInterval(() => { if (!document.hidden) checkForUpdate(); }, 10 * 60 * 1000);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) checkForUpdate(); });
+
+window.rmopViewer = {select, selectRun, checkForUpdate, get runs() { return runs; }, get state() { return {runIdx, latestIdx, cur, playing: !!timer}; }};
+applyHash(location.hash === "");
 </script>
 </body>
 </html>
 """
 
 
-def build_site(site, entries, args, init, credit_text, nmem, dlat):
-    """Write manifest.json and the self-contained viewer (index.html) into the site folder."""
+def load_manifest(site):
+    """Previous manifest in the site folder (restored from the cache), or None."""
+    try:
+        with open(os.path.join(site, "manifest.json"), encoding="utf-8") as f:
+            m = json.load(f)
+        return m if isinstance(m.get("inits"), list) else None
+    except (OSError, ValueError):
+        return None
+
+
+def build_site(site, entries, args, init, credit_text, nmem, dlat, expected=None):
+    """Merge this run into the site's archive, drop runs older than --keep-days, delete orphaned
+    images, and write manifest.json + the self-contained viewer (index.html)."""
+    import shutil
     from PIL import Image
-    entries = sorted(entries, key=lambda e: e["lead"])
-    lo, la = tuple(args.plot_lon), tuple(args.plot_lat)
-    with Image.open(os.path.join(site, entries[0]["png"])) as full, \
-            Image.open(os.path.join(site, entries[0]["web"])) as web:
-        fw, fh, ww, wh = full.width, full.height, web.width, web.height
+    old = load_manifest(site) or {}
+    runs = {r["id"]: r for r in old.get("inits", []) if "id" in r and "init" in r}
+    rid = init_id(init)
+    merged = {e["lead"]: e for e in runs.get(rid, {}).get("leads", [])}
+    merged.update({e["lead"]: e for e in entries})                # leads from this run win
+    want = sorted(set(runs.get(rid, {}).get("expected", [])) | set(expected or [e["lead"] for e in entries]))
+    runs[rid] = {"id": rid, "init": init.strftime(ISO), "members": nmem, "expected": want,
+                 "leads": list(merged.values())}
+
+    # keep only runs inside the window, and only leads whose PNG is really there
+    stamp = lambda r: datetime.strptime(r["init"], ISO)
+    cutoff = max(stamp(r) for r in runs.values()) - timedelta(days=args.keep_days)
+    kept = {}
+    for k, r in runs.items():
+        r["leads"] = sorted((e for e in r["leads"] if os.path.isfile(os.path.join(site, e["png"]))),
+                            key=lambda e: e["lead"])
+        have = {e["lead"] for e in r["leads"]}
+        r["complete"] = (not r.get("expected")) or set(r["expected"]) <= have     # every planned hour is there
+        if stamp(r) > cutoff and r["leads"]:
+            kept[k] = r
+    ordered = sorted(kept.values(), key=stamp, reverse=True)       # newest first
+
+    for legacy in ("web", "geo", "data"):                          # folders from older builds: PNG only now
+        shutil.rmtree(os.path.join(site, legacy), ignore_errors=True)
+    img_root = os.path.join(site, "img")                           # delete what the manifest no longer lists
+    listed = {os.path.normpath(os.path.join(site, e["png"])) for r in ordered for e in r["leads"]}
+    for d in os.listdir(img_root):
+        p = os.path.join(img_root, d)
+        if os.path.isdir(p):
+            if d not in kept:
+                shutil.rmtree(p, ignore_errors=True)
+                continue
+            for fn in os.listdir(p):
+                if os.path.normpath(os.path.join(p, fn)) not in listed:
+                    os.remove(os.path.join(p, fn))
+        elif d.endswith(".png"):                                   # flat files from an older layout
+            os.remove(p)
+
+    with Image.open(os.path.join(site, ordered[0]["leads"][0]["png"])) as im:
+        iw, ih = im.size
     manifest = {
         "title": "Relative Measure of Predictability", "variable": "500 hPa height",
-        "model": "NCEP GEFS", "init": f"{init:%Y-%m-%dT%H:%M:%SZ}", "members": nmem,
-        "grid_deg": round(dlat, 4), "method": "RMOP after Toth, Zhu & Marchok (2001)",
-        "credit": credit_text, "bounds": {"lon": list(lo), "lat": list(la)}, "wrap360": lo[1] > 180.0,
-        "image": {"w": ww, "h": wh, "full_w": fw, "full_h": fh, "dpi": args.dpi},
+        "model": "NCEP GEFS", "members": nmem, "grid_deg": round(dlat, 4),
+        "method": "", "credit": credit_text,
+        "keep_days": args.keep_days, "latest": ordered[0]["init"],
+        "image": {"w": iw, "h": ih, "dpi": args.dpi},
         "colors": [{"class": k, "min": 10 * k, "max": 10 * (k + 1), "color": _hex(RMOP_COLORS[k])}
                    for k in range(N_CLASSES)],
-        "site_hint": os.path.basename(os.path.abspath(site)), "leads": entries,
-        "generator": "rmop.py", "geojson": not args.no_geo}
-    with open(os.path.join(site, "manifest.json"), "w") as f:
-        json.dump(manifest, f, indent=1)
-    blob = json.dumps(manifest).replace("</", "<\\/")
+        "inits": ordered, "generator": "rmop.py"}
+    with open(os.path.join(site, "manifest.json"), "w", encoding="utf-8") as f:
+        json.dump(manifest, f, separators=(",", ":"))
+    blob = json.dumps(manifest, separators=(",", ":")).replace("</", "<\\/")
     with open(os.path.join(site, "index.html"), "w", encoding="utf-8") as f:
         f.write(_VIEWER_HTML.replace("__TITLE__", "RMOP Redux - forecast viewer").replace("__MANIFEST__", blob))
+    n_part = sum(not r["complete"] for r in ordered)
+    n_png = sum(len(r["leads"]) for r in ordered)
+    size = sum(os.path.getsize(os.path.join(site, e["png"])) for r in ordered for e in r["leads"])
+    print(f"archive: {len(ordered)} runs, {n_png} images, {size / 1e6:.0f} MB "
+          f"(window {args.keep_days} days)" + (f", {n_part} partial" if n_part else ""))
     return manifest
 
 
 def serve_site(root, host="127.0.0.1", port=8000, open_browser=False):
-    """Tiny static server for the site folder: correct MIME types and CORS headers, so the map
-    view (which fetches the GeoJSON layers) works and other web apps can read the layers."""
+    """Tiny static server for the site folder (the viewer also opens straight from disk)."""
     import functools
     import http.server
 
     class Handler(http.server.SimpleHTTPRequestHandler):
-        extensions_map = {**http.server.SimpleHTTPRequestHandler.extensions_map,
-                          ".geojson": "application/geo+json", ".webp": "image/webp",
-                          ".tif": "image/tiff", ".json": "application/json"}
-
         def end_headers(self):
-            self.send_header("Access-Control-Allow-Origin", "*")
             fresh = self.path.split("?")[0].endswith((".html", ".json", "/"))
             self.send_header("Cache-Control", "no-cache" if fresh else "public, max-age=3600")
             super().end_headers()
@@ -2321,8 +2206,7 @@ def serve_site(root, host="127.0.0.1", port=8000, open_browser=False):
     handler = functools.partial(Handler, directory=root)
     with http.server.ThreadingHTTPServer((host, port), handler) as srv:
         url = f"http://{'localhost' if host in ('127.0.0.1', '0.0.0.0') else host}:{port}/"
-        print(f"serving {os.path.abspath(root)}\n  viewer:   {url}\n  manifest: {url}manifest.json\n"
-              f"  GeoJSON:  {url}geo/   (CORS enabled)\n  Ctrl+C to stop")
+        print(f"serving {os.path.abspath(root)}\n  viewer: {url}\n  Ctrl+C to stop")
         if open_browser:
             import webbrowser
             webbrowser.open(url)
@@ -2371,11 +2255,6 @@ def run_product(src, clim, init, lead, args, eng=None):
         v = "" if hr is None or not np.isfinite(hr[k]) else f"{hr[k]:6.1f}"
         print(f"{k*10:3d}-{k*10+10:<3d}  {np.mean(cls == k):10.3f}  {v}")
 
-    npz = (os.path.join(args.npz_dir, os.path.splitext(os.path.basename(args.out))[0] + ".npz")
-           if getattr(args, "npz_dir", None) else args.out.rsplit(".", 1)[0] + ".npz")
-    np.savez_compressed(npz, lat=eng.geom.lat,
-                        lon=eng.geom.lon, rmop=pct.astype(np.float32),
-                        count=cnt, ens_mean=mean, hit_rates=np.nan if hr is None else hr)
     plot_rmop(args.out, eng.geom.lat, eng.geom.lon, pct, mean_c, init, valid, lead, hr,
               plot_lon=tuple(args.plot_lon), plot_lat=tuple(args.plot_lat),
               coast=not args.no_coast, dpi=args.dpi, scale=args.scale, style=args.style,
@@ -2424,12 +2303,10 @@ def run_leads(src, clim, init, a):
     base_out, done, failed, entries, last = a.out, [], [], [], None
     site = getattr(a, "site", None)
     if site:
-        for sub in ("img", "web", "data") + (() if a.no_geo else ("geo",)):
-            os.makedirs(os.path.join(site, sub), exist_ok=True)
-        a.npz_dir = os.path.join(site, "data")
-        print(f"building site in {site}/  (images, web previews, GIS layers, viewer)")
+        os.makedirs(os.path.join(site, "img", init_id(init)), exist_ok=True)
+        print(f"building site in {site}/  (PNG images + viewer, {a.keep_days}-day archive)")
     for L in leads:
-        a.out = (os.path.join(site, "img", f"rmop_f{L:03d}.png") if site
+        a.out = (os.path.join(site, "img", init_id(init), f"rmop_f{L:03d}.png") if site
                  else lead_path(base_out, L, multi))
         print(f"\n=== lead {L} h ({leads.index(L) + 1}/{len(leads)}) ===")
         try:
@@ -2452,12 +2329,13 @@ def run_leads(src, clim, init, a):
     if site and entries:
         credit_text = (f"RMOP Redux" + (f" by {a.credit_name}" if a.credit_name else "")
                        + " \u00b7 after Toth, Zhu & Marchok (2001)") if not a.credit else a.credit
-        build_site(site, entries, a, init, credit_text, last["nmem"], last["dlat"])
+        build_site(site, entries, a, init, credit_text, last["nmem"], last["dlat"], leads)
         print(f"\nviewer ready: {os.path.join(site, 'index.html')}"
-              f"\n  open it directly for the hour slider, or run:  python3 rmop.py serve {site}"
-              f"\n  (the server also enables the OpenStreetMap view and serves the GeoJSON layers)")
-    if failed:
-        sys.exit(1)
+              f"\n  open it directly, or run:  python3 rmop.py serve {site}")
+    if failed and (not done or not site):
+        sys.exit(1)               # nothing usable was produced
+    if failed and os.environ.get("GITHUB_ACTIONS"):
+        print("::warning::" + "; ".join(f"f{L:03d} failed" for L, _ in failed))
 
 
 def parse_init(s: str) -> datetime:
@@ -2523,15 +2401,14 @@ def main(argv=None):
                        help="line/lettering weight multiplier for the high-resolution output "
                             "(1 = default; 1.3 bolder, 0.8 lighter)")
         p.add_argument("--site", metavar="DIR", default=None,
-                       help="build a complete package in DIR: hour-slider web viewer (index.html), "
-                            "manifest.json, full-resolution PNGs, web previews and GIS layers "
-                            "(GeoJSON + GeoTIFF).  Overrides --out.")
-        p.add_argument("--no-geo", action="store_true", help="with --site: skip GeoJSON/GeoTIFF export")
-        p.add_argument("--web-width", type=int, default=2000, help="with --site: preview image width (px)")
-        p.add_argument("--geo-simplify", type=float, default=0.02,
-                       help="GeoJSON polygon simplification tolerance in degrees (0 = none)")
-        p.add_argument("--geo-min-cells", type=float, default=2.0,
-                       help="drop GeoJSON polygons smaller than this many grid cells")
+                       help="build a web package in DIR: img/<init>/rmop_fHHH.png for every lead, a "
+                            "manifest.json index and an index.html dashboard.  Runs already in DIR "
+                            "are kept for --keep-days.  Overrides --out.")
+        p.add_argument("--keep-days", type=int, default=7,
+                       help="with --site: how many days of earlier runs stay in the archive (default 7)")
+        p.add_argument("--png-colors", type=int, default=256, metavar="N",
+                       help="PNG palette size (default 256 = visually lossless, ~60%% smaller files); "
+                            "0 = full-colour RGB")
         p.add_argument("--cache", default="./rmop_cache")
         p.add_argument("--out", default="rmop.png", help=".png (default) or .gif")
 
@@ -2549,13 +2426,15 @@ def main(argv=None):
     d.add_argument("--tscale", type=float, default=1.0, help="synthetic error-growth slowdown")
     d.set_defaults(stride=1)          # synthetic grid is already 2.5 deg
 
-    v = sub.add_parser("serve", help="serve a --site folder (viewer, manifest, GeoJSON) on localhost")
+    v = sub.add_parser("serve", help="serve a --site folder on localhost")
     v.add_argument("dir", help="the folder written with --site")
     v.add_argument("--port", type=int, default=8000)
     v.add_argument("--host", default="127.0.0.1", help="use 0.0.0.0 to share on your network")
     v.add_argument("--open", action="store_true", help="open the viewer in your browser")
 
     a = ap.parse_args(argv)
+    global PNG_COLORS
+    PNG_COLORS = getattr(a, "png_colors", PNG_COLORS)
     logging.basicConfig(level=logging.INFO if a.verbose else logging.WARNING,
                         format="%(levelname)s %(message)s")
 

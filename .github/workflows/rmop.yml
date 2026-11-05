@@ -1,12 +1,17 @@
+# .github/workflows/rmop.yml
+# Builds the RMOP dashboard for every GEFS cycle (00/06/12/18Z), keeps the last 7 days of
+# PNG images, and publishes everything to GitHub Pages.
 name: RMOP
 
 on:
   schedule:
-    - cron: "0 8 * * *"          # daily, ~8 UTC; check that the 00Z GEFS cycle is complete by then
+    # ~5 h after each cycle starts (NCEP publishes a cycle roughly 3-6 h after its nominal time).
+    # The "wait" step below polls until the last file exists, so a late cycle is fine.
+    - cron: "17 5,11,17,23 * * *"
   workflow_dispatch:
     inputs:
       init:
-        description: "Init time YYYYMMDDHH (blank = today 00Z)"
+        description: "Init time YYYYMMDDHH (HH = 00/06/12/18). Blank = newest cycle that is at least 5 h old."
         required: false
 
 permissions:
@@ -17,6 +22,10 @@ permissions:
 concurrency:
   group: rmop
   cancel-in-progress: false
+
+env:
+  LAST_LEAD: "240"          # forecast hours are 12, 24 ... LAST_LEAD
+  KEEP_DAYS: "7"
 
 jobs:
   build:
@@ -30,26 +39,65 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install numpy scipy pillow matplotlib requests eccodes shapely cartopy xarray
+        run: pip install numpy pillow matplotlib requests eccodes cartopy
 
-      # Rolling cache of the 30-day history, so each daily run only computes the newest day.
+      # 30-day history used to rank each forecast (one entry per cycle/day/hour).
       - name: Restore history cache
         uses: actions/cache/restore@v4
         with:
           path: rmop_cache
-          key: rmop-cache-${{ github.run_id }}
+          key: rmop-cache-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: rmop-cache-
 
-      - name: Build RMOP site
-        timeout-minutes: 320     # step-level limit so the cache-save step below still runs
+      # The previous site (images + manifest) is how the 7-day archive survives between runs.
+      - name: Restore archive
+        uses: actions/cache/restore@v4
+        with:
+          path: site
+          key: rmop-site-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: rmop-site-
+
+      - name: Pick the GEFS cycle and wait until it is complete
+        id: cycle
+        timeout-minutes: 130
         env:
           INIT_IN: ${{ inputs.init }}
         run: |
-          INIT="${INIT_IN:-$(date -u +%Y%m%d)00}"
-          python rmop.py run --init "$INIT" --lead-range 12 240 12 \
-            --climo climo_z500.npz --site site --cache rmop_cache
+          set -euo pipefail
+          if [ -n "${INIT_IN:-}" ]; then
+            [[ "$INIT_IN" =~ ^[0-9]{8}(00|06|12|18)$ ]] || { echo "::error::init must be YYYYMMDDHH with HH = 00, 06, 12 or 18"; exit 1; }
+            INIT="$INIT_IN"
+          else
+            T=$(( $(date -u +%s) - 5*3600 ))      # newest cycle that started at least 5 h ago
+            T=$(( T - T % 21600 ))
+            INIT=$(date -u -d "@$T" +%Y%m%d%H)
+          fi
+          echo "init=$INIT" >> "$GITHUB_OUTPUT"
+          echo "Cycle: $INIT"
+          D=${INIT:0:8}; H=${INIT:8:2}; F=$(printf '%03d' "$LAST_LEAD")
+          base="https://noaa-gefs-pds.s3.amazonaws.com/gefs.$D/$H/atmos/pgrb2ap5"
+          ok=0
+          for try in $(seq 1 24); do
+            ok=1
+            for m in gec00 gep30; do
+              code=$(curl -s -o /dev/null -w '%{http_code}' -I "$base/$m.t${H}z.pgrb2a.0p50.f$F.idx" || true)
+              [ "$code" = 200 ] || ok=0
+            done
+            [ "$ok" = 1 ] && break
+            echo "GEFS $INIT is not complete yet (check $try/24), waiting 5 min"
+            sleep 300
+          done
+          [ "$ok" = 1 ] || { echo "::error::GEFS $INIT still incomplete after 2 h"; exit 1; }
 
-      - name: Prune cache older than 35 days
+      - name: Build RMOP site
+        timeout-minutes: 320     # step-level limit so the cache-save steps below still run
+        env:
+          INIT: ${{ steps.cycle.outputs.init }}
+        run: |
+          python rmop.py run --init "$INIT" --lead-range 12 "$LAST_LEAD" 12 \
+            --climo climo_z500.npz --site site --cache rmop_cache --keep-days "$KEEP_DAYS"
+
+      - name: Prune history cache older than 35 days
         if: always()
         run: find rmop_cache -name '*.npz' -mtime +35 -delete 2>/dev/null || true
 
@@ -58,7 +106,14 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: rmop_cache
-          key: rmop-cache-${{ github.run_id }}
+          key: rmop-cache-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Save archive
+        if: success()
+        uses: actions/cache/save@v4
+        with:
+          path: site
+          key: rmop-site-${{ github.run_id }}-${{ github.run_attempt }}
 
       - uses: actions/upload-pages-artifact@v3
         with:
