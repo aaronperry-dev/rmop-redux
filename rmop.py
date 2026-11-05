@@ -847,7 +847,7 @@ def coast_segments():
 
 def plot_rmop_mpl(path, lat, lon, pct, mean_z, init, valid, lead, hit_rates,
                   plot_lon=(170.0, 300.0), plot_lat=(20.0, 80.0), coast=True, dpi=200,
-                  credit="RMOP emulation from GEFS (rmop.py)"):
+                  credit=""):
     """RMOP map laid out like the 2001 EMC graphic: three-line title, plain lat/lon
     map with dotted grid and thick black height contours (metres, 40 m interval),
     shading in ten 10% classes (blue = low ... orange = high), a 'Probability (%)'
@@ -1603,7 +1603,7 @@ def _save_rgb(path, rgb, dpi=300):
 
 def _plot_grads(path, lat, lon, pct, mean_z, init, valid, lead, hit_rates,
                 plot_lon=(170.0, 300.0), plot_lat=(20.0, 80.0), coast=True, scale=1,
-                credit="RMOP emulation from GEFS (rmop.py)", title_lines=None, dpi=300,
+                credit="", title_lines=None, dpi=300,
                 stroke=1.0):
     S = max(int(scale), 1)
     lo, la = tuple(plot_lon), tuple(plot_lat)
@@ -1707,7 +1707,7 @@ def _save_indexed(path, img, dpi=300):
 
 def plot_rmop(path, lat, lon, pct, mean_z, init, valid, lead, hit_rates,
               plot_lon=(170.0, 300.0), plot_lat=(20.0, 80.0), coast=True, dpi=300,
-              scale=5, style="grads", credit="RMOP emulation from GEFS (rmop.py)", stroke=1.0):
+              scale=5, style="grads", credit="", stroke=1.0):
     """style 'grads' (default): re-render of the original GrADS graphic.  scale 1 gives the
     original 695 x 545 pixels; scale 5 at 300 DPI is the 11 x 8.5 in page at print size.
     style 'mpl': smooth matplotlib version with the same layout."""
@@ -1755,7 +1755,8 @@ _VIEWER_HTML = r"""<!doctype html>
   --accent:#2563eb; --accent-2:#1d4ed8; --on-accent:#fff;
   --shadow:0 1px 2px rgba(12,20,36,.06),0 18px 40px -18px rgba(12,20,36,.28);
   --radius:20px; --hover:rgba(37,99,235,.09);
-  --chrome:300px;               /* page height used by everything except the image */
+  --chrome:222px;        /* page height used by everything except the image */
+  --chrome-x:128px;     /* same, when the viewer is expanded to the full window */
   font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Inter,Roboto,"Helvetica Neue",Arial,sans-serif;
 }
 @media (prefers-color-scheme:dark){
@@ -1767,8 +1768,8 @@ _VIEWER_HTML = r"""<!doctype html>
 html{-webkit-text-size-adjust:100%}
 body{margin:0;background:var(--bg);color:var(--ink);line-height:1.45;
   background-image:radial-gradient(1200px 500px at 50% -10%,color-mix(in srgb,var(--accent) 10%,transparent),transparent 70%)}
-.app{max-width:1180px;margin:0 auto;padding:clamp(12px,2.4vw,26px) clamp(12px,3vw,28px) 36px}
-.top{display:flex;flex-wrap:wrap;gap:10px 24px;align-items:flex-end;justify-content:space-between;margin-bottom:14px}
+.app{max-width:1180px;margin:0 auto;padding:clamp(10px,1.6vw,18px) clamp(10px,2.4vw,24px) 32px}
+.top{display:flex;flex-wrap:wrap;gap:8px 24px;align-items:flex-end;justify-content:space-between;margin-bottom:10px}
 .top h1{margin:0;font-size:clamp(19px,2.8vw,27px);letter-spacing:-.02em;font-weight:720}
 .top p{margin:3px 0 0;color:var(--muted);font-size:13.5px}
 .runs{display:flex;flex-wrap:wrap;gap:8px}
@@ -1783,8 +1784,8 @@ body{margin:0;background:var(--bg);color:var(--ink);line-height:1.45;
 .stage{background:color-mix(in srgb,var(--ink) 4%,var(--card));border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
 /* the image is as large as fits in the window height (never taller than the screen) and never wider than the card */
 .viewport{position:relative;overflow:hidden;background:#fff;margin:0 auto;isolation:isolate;aspect-ratio:var(--ar,1.275);
-  width:min(100%,max(340px,calc((100vh - var(--chrome)) * var(--ar,1.275))));
-  width:min(100%,max(340px,calc((100dvh - var(--chrome)) * var(--ar,1.275))))}
+  width:min(100%,calc(max(480px,100vh - var(--chrome)) * var(--ar,1.275)));
+  width:min(100%,calc(max(480px,100dvh - var(--chrome)) * var(--ar,1.275)))}
 .layer{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;opacity:0;transition:opacity .2s ease;
   user-select:none;-webkit-user-drag:none}
 .layer.on{opacity:1}
@@ -1792,7 +1793,7 @@ body{margin:0;background:var(--bg);color:var(--ink);line-height:1.45;
   color-mix(in srgb,var(--ink) 5%,var(--card));animation:sh 1.3s linear infinite;transition:opacity .3s}
 .skeleton.done{opacity:0;pointer-events:none}
 @keyframes sh{to{background-position:-200% 0}}
-.bar{display:flex;align-items:center;gap:14px;padding:10px clamp(12px,2vw,20px);flex-wrap:wrap}
+.bar{display:flex;align-items:center;gap:12px;padding:8px clamp(10px,1.6vw,16px);flex-wrap:wrap}
 .now{flex:1;min-width:150px;display:flex;flex-wrap:wrap;align-items:baseline;gap:0 12px}
 .now b{font-size:clamp(18px,2.8vw,23px);letter-spacing:-.02em;font-variant-numeric:tabular-nums}
 .now span{color:var(--muted);font-size:14px;font-weight:550}
@@ -1800,30 +1801,47 @@ body{margin:0;background:var(--bg);color:var(--ink);line-height:1.45;
 .tag.latest{color:var(--accent-2);background:color-mix(in srgb,var(--accent) 13%,transparent)}
 .tag.warn{color:#8a5a00;background:rgba(245,166,35,.2)}
 @media (prefers-color-scheme:dark){.tag.warn{color:#ffc766;background:rgba(245,166,35,.18)}}
-.update{all:unset;cursor:pointer;position:fixed;left:50%;bottom:18px;transform:translateX(-50%);z-index:20;max-width:calc(100vw - 24px);
-  padding:11px 18px;border-radius:999px;background:var(--accent);color:var(--on-accent);font-size:14px;font-weight:650;
-  box-shadow:0 14px 34px -10px rgba(0,0,0,.45);text-align:center}
+.update{all:unset;cursor:pointer;padding:5px 12px;border-radius:999px;background:var(--accent);color:var(--on-accent);
+  font-size:12.5px;font-weight:700;white-space:nowrap;box-shadow:0 6px 14px -6px var(--accent)}
 .update[hidden]{display:none}
 .update:hover{filter:brightness(1.08)}.update:focus-visible{outline:2px solid var(--ink);outline-offset:3px}
-.controls{padding:12px clamp(12px,2vw,20px) 16px}
+.controls{padding:8px clamp(10px,1.6vw,16px) 12px}
 .play{all:unset;cursor:pointer;flex:none;width:40px;height:40px;border-radius:50%;display:grid;place-items:center;background:var(--accent);color:var(--on-accent);
   box-shadow:0 8px 18px -8px var(--accent);transition:transform .15s,filter .15s}
 .play:hover{filter:brightness(1.08)}.play:active{transform:scale(.94)}
 .play:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
 .play svg{width:18px;height:18px;fill:currentColor}
 .play .i-pause{display:none}.play[aria-pressed=true] .i-play{display:none}.play[aria-pressed=true] .i-pause{display:block}
-.progress{height:3px;border-radius:3px;background:color-mix(in srgb,var(--ink) 9%,transparent);margin:0 2px 9px;overflow:hidden}
+.progress{height:3px;border-radius:3px;background:color-mix(in srgb,var(--ink) 9%,transparent);margin:0 0 6px;overflow:hidden}
 .progress i{display:block;height:100%;background:var(--accent);transform-origin:left;transform:scaleX(var(--p,0));transition:transform .25s cubic-bezier(.2,.8,.2,1)}
-.rail{display:grid;grid-template-columns:repeat(auto-fit,minmax(58px,1fr));gap:5px;touch-action:none;user-select:none;-webkit-user-select:none}
-.rail button{all:unset;box-sizing:border-box;cursor:pointer;text-align:center;padding:8px 4px 7px;border-radius:12px;display:grid;gap:1px;position:relative;
-  transition:background .15s,color .15s,transform .18s cubic-bezier(.2,.8,.2,1),box-shadow .18s;-webkit-tap-highlight-color:transparent}
-.rail button b{font-size:14px;letter-spacing:-.01em;font-variant-numeric:tabular-nums}
-.rail button small{font-size:11px;color:var(--muted);font-variant-numeric:tabular-nums;white-space:nowrap}
-.rail button.day::before{content:"";position:absolute;left:-4px;top:18%;bottom:18%;width:1px;background:color-mix(in srgb,var(--ink) 16%,transparent)}
+.rail{display:flex;gap:0;touch-action:none;user-select:none;-webkit-user-select:none;border-radius:11px;overflow:hidden;
+  background:color-mix(in srgb,var(--ink) 4%,transparent)}
+.rail button{all:unset;box-sizing:border-box;flex:1 1 0;min-width:0;cursor:pointer;text-align:center;padding:6px 0 5px;display:grid;gap:0;position:relative;
+  transition:background .12s,color .12s;-webkit-tap-highlight-color:transparent}
+.rail button b{font-size:13px;line-height:1.25;letter-spacing:-.01em;font-variant-numeric:tabular-nums}
+.rail button small{font-size:10px;line-height:1.2;color:var(--muted);font-variant-numeric:tabular-nums;white-space:nowrap}
+.rail button.day::before{content:"";position:absolute;left:0;top:14%;bottom:14%;width:1px;background:color-mix(in srgb,var(--ink) 20%,transparent)}
 .rail button:hover{background:var(--hover)}
-.rail button[aria-selected=true]{background:var(--accent);color:var(--on-accent);transform:translateY(-1px) scale(1.04);box-shadow:0 10px 20px -10px var(--accent)}
-.rail button[aria-selected=true] small{color:inherit;opacity:.85}
-.rail button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.rail button[aria-selected=true]{background:var(--accent);color:var(--on-accent)}
+.rail button[aria-selected=true] small{color:inherit;opacity:.88}
+.rail button[aria-selected=true]::before{display:none}
+.rail button:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+.icon{all:unset;cursor:pointer;flex:none;width:34px;height:34px;display:grid;place-items:center;border-radius:10px;color:var(--muted)}
+.icon:hover{background:var(--hover);color:var(--ink)}.icon:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.icon svg{width:18px;height:18px}
+.zoomer{position:absolute;inset:0;transform-origin:0 0;will-change:transform}
+.viewport{touch-action:pan-y;cursor:zoom-in}
+.viewport.zoomed{touch-action:none;cursor:grab}.viewport.zoomed:active{cursor:grabbing}
+.zoomchip{position:absolute;right:8px;bottom:8px;z-index:4;pointer-events:none;font-size:12px;font-weight:650;padding:4px 10px;border-radius:999px;
+  background:rgba(12,20,36,.72);color:#fff}
+.zoomchip[hidden]{display:none}
+body.noscroll{overflow:hidden}
+.card.expanded{position:fixed;inset:0;z-index:50;border-radius:0;border:0;display:flex;flex-direction:column;overflow:hidden}
+.card.expanded .stage{flex:1;min-height:0;display:flex;align-items:center;justify-content:center}
+.card.expanded .viewport{width:min(100%,max(300px,calc((100vh - var(--chrome-x)) * var(--ar,1.275))));
+  width:min(100%,max(300px,calc((100dvh - var(--chrome-x)) * var(--ar,1.275))));cursor:default}
+.card.expanded .viewport.zoomed{cursor:grab}
+.card.expanded .viewport{touch-action:none}
 .grid{display:grid;gap:16px;margin-top:18px;grid-template-columns:repeat(auto-fit,minmax(260px,1fr))}
 .tile{padding:16px 18px}
 .tile h2{margin:0 0 8px;font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);font-weight:700}
@@ -1834,10 +1852,14 @@ body{margin:0;background:var(--bg);color:var(--ink);line-height:1.45;
 .legend div{display:flex;align-items:center;gap:8px}.legend i{width:16px;height:16px;border-radius:5px;border:1px solid var(--line);flex:none}
 footer{margin-top:22px;color:var(--muted);font-size:12.5px;text-align:center}
 kbd{font:inherit;font-size:11.5px;padding:1px 6px;border-radius:6px;border:1px solid var(--line);background:color-mix(in srgb,var(--ink) 5%,transparent)}
+@media (max-width:900px){
+  .rail{flex-wrap:wrap}.rail button{flex:1 0 10%}.rail button.day::before{display:none}
+  :root{--chrome:252px;--chrome-x:168px}
+}
 @media (max-width:640px){
-  .rail{grid-template-columns:repeat(5,1fr)}.rail button small{font-size:10.5px}
+  .rail button{flex:1 0 10%}.rail button b{font-size:12.5px}.rail button small{font-size:9.5px}.rail .wd,.rail .pm{display:none}
   .bar{gap:10px}.runs{width:100%}
-  :root{--chrome:360px}
+  :root{--chrome:356px;--chrome-x:170px}
 }
 @media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
 </style>
@@ -1852,20 +1874,27 @@ kbd{font:inherit;font-size:11.5px;padding:1px 6px;border-radius:6px;border:1px s
     </div>
   </header>
 
-  <section class="card" aria-label="Forecast viewer">
+  <section class="card" id="card" aria-label="Forecast viewer">
     <div class="bar">
       <button class="play" id="play" aria-pressed="false" aria-label="Play forecast loop" title="Play / pause (Space)">
         <svg class="i-play" viewBox="0 0 24 24"><path d="M8 5.5v13a1 1 0 0 0 1.5.86l10.5-6.5a1 1 0 0 0 0-1.72L9.5 4.64A1 1 0 0 0 8 5.5Z"/></svg>
         <svg class="i-pause" viewBox="0 0 24 24"><rect x="6.5" y="5" width="4" height="14" rx="1.2"/><rect x="13.5" y="5" width="4" height="14" rx="1.2"/></svg>
       </button>
       <div class="now" aria-live="polite"><b id="chipLead"></b><span id="chipValid"></span></div>
+      <button class="update" id="update" hidden></button>
       <span class="tag" id="runTag"></span>
+      <button class="icon" id="expand" aria-pressed="false" aria-label="Expand image" title="Expand (F)">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>
+      </button>
     </div>
     <div class="stage">
       <div class="viewport" id="viewport">
-        <img id="imgA" class="layer" alt="" draggable="false" decoding="async">
-        <img id="imgB" class="layer" alt="" draggable="false" decoding="async">
+        <div class="zoomer" id="zoomer">
+          <img id="imgA" class="layer" alt="" draggable="false" decoding="async">
+          <img id="imgB" class="layer" alt="" draggable="false" decoding="async">
+        </div>
         <div class="skeleton" id="skeleton"></div>
+        <div class="zoomchip" id="zoomchip" hidden></div>
       </div>
     </div>
     <div class="controls">
@@ -1879,11 +1908,10 @@ kbd{font:inherit;font-size:11.5px;padding:1px 6px;border-radius:6px;border:1px s
     <section class="card tile"><h2>RMOP scale</h2><div class="legend" id="legend"></div>
       <p style="margin-top:10px"><small>Colours show how many ensemble members agree with the ensemble mean, relative to recent forecasts.</small></p></section>
     <section class="card tile"><h2>About</h2><p id="about"></p>
-      <p style="margin-top:8px"><small>Hover or tap an hour. <kbd>←</kbd> <kbd>→</kbd> step hours, <kbd>[</kbd> <kbd>]</kbd> older / newer run, <kbd>Space</kbd> plays.</small></p></section>
+      <p style="margin-top:8px"><small>Hover or tap an hour. <kbd>←</kbd> <kbd>→</kbd> step hours, <kbd>[</kbd> <kbd>]</kbd> older / newer run, <kbd>Space</kbd> plays. Double-click or <kbd>Ctrl</kbd>+scroll to zoom, drag to pan, <kbd>F</kbd> expands, <kbd>Esc</kbd> closes.</small></p></section>
   </div>
   <footer id="credit"></footer>
 </main>
-<button class="update" id="update" hidden></button>
 <noscript><p style="padding:20px">This viewer needs JavaScript.</p></noscript>
 
 <script type="application/json" id="manifest">__MANIFEST__</script>
@@ -1950,7 +1978,7 @@ function buildRail() {
   items.forEach((it, i) => {
     const b = document.createElement("button");
     b.type = "button"; b.dataset.i = i; b.setAttribute("role", "option");
-    b.innerHTML = `<b>+${it.lead}h</b><small>${dayName(it.valid)} ${hourZ(it.valid)}</small>`;
+    b.innerHTML = `<b><span class="pm">+</span>${it.lead}<span class="pm">h</span></b><small><span class="wd">${dayName(it.valid)} </span>${hourZ(it.valid)}</small>`;
     if (i > 0 && dayKey(it.valid) !== dayKey(items[i - 1].valid)) b.classList.add("day");
     b.title = `+${it.lead} h — valid ${longValid(it.valid)}`;
     rail.appendChild(b);
@@ -2048,7 +2076,70 @@ document.addEventListener("keydown", e => {
   else if (k === "[") { e.preventDefault(); pausePlay(); selectRun(runIdx + 1); }      // older run
   else if (k === "]") { e.preventDefault(); pausePlay(); selectRun(runIdx - 1); }      // newer run (may be partial)
   else if (k === " " && e.target.tagName !== "BUTTON") { e.preventDefault(); togglePlay(); }
+  else if (k === "f" || k === "F") { e.preventDefault(); setExpanded(!expanded); }
+  else if (k === "Escape" && expanded) { e.preventDefault(); setExpanded(false); }
+  else if (k === "0") { zs = 1; zx = zy = 0; applyZoom(); }
 });
+
+/* ---------- zoom, pan and expand ---------- */
+const vp = $("viewport"), zoomer = $("zoomer"), ZMAX = 6;
+let zs = 1, zx = 0, zy = 0, expanded = false;
+function applyZoom() {
+  const r = vp.getBoundingClientRect();
+  zs = Math.min(ZMAX, Math.max(1, zs));
+  zx = zs === 1 ? 0 : Math.min(0, Math.max(r.width * (1 - zs), zx));        // the image always covers the viewport
+  zy = zs === 1 ? 0 : Math.min(0, Math.max(r.height * (1 - zs), zy));
+  zoomer.style.transform = zs === 1 ? "" : `translate(${zx}px,${zy}px) scale(${zs})`;
+  vp.classList.toggle("zoomed", zs > 1);
+  $("zoomchip").hidden = zs === 1;
+  $("zoomchip").textContent = `${zs.toFixed(1)}× · double-click to reset`;
+}
+function zoomAt(cx, cy, ns) {                           // cx, cy: point under the cursor, relative to the viewport
+  ns = Math.min(ZMAX, Math.max(1, ns));
+  const k = ns / zs;
+  zx = cx - (cx - zx) * k; zy = cy - (cy - zy) * k; zs = ns; applyZoom();
+}
+function setExpanded(on) {
+  expanded = on;
+  $("card").classList.toggle("expanded", on); document.body.classList.toggle("noscroll", on);
+  $("expand").setAttribute("aria-pressed", on); $("expand").title = on ? "Close (Esc)" : "Expand (F)";
+  zs = 1; zx = zy = 0; applyZoom();
+}
+$("expand").addEventListener("click", () => setExpanded(!expanded));
+vp.addEventListener("wheel", e => {                     // Ctrl/Cmd + scroll (also trackpad pinch); plain scroll when expanded
+  if (!(e.ctrlKey || e.metaKey || expanded)) return;
+  e.preventDefault();
+  const r = vp.getBoundingClientRect();
+  const gain = e.ctrlKey && Math.abs(e.deltaY) < 40 ? 0.012 : 0.0022;     // trackpad pinch sends small deltas, a wheel notch ~100
+  zoomAt(e.clientX - r.left, e.clientY - r.top, zs * Math.exp(-e.deltaY * gain));
+}, {passive: false});
+const ptrs = new Map(); let pinch = null, lastTap = {t: 0, x: 0, y: 0}, moved = 0;
+vp.addEventListener("pointerdown", e => {
+  ptrs.set(e.pointerId, {x: e.clientX, y: e.clientY}); moved = 0;
+  try { vp.setPointerCapture(e.pointerId); } catch (_) {}
+  if (ptrs.size === 2) { const [a, b] = [...ptrs.values()]; pinch = {d: Math.hypot(a.x - b.x, a.y - b.y) || 1, s: zs}; }
+});
+vp.addEventListener("pointermove", e => {
+  const p = ptrs.get(e.pointerId); if (!p) return;
+  const dx = e.clientX - p.x, dy = e.clientY - p.y; p.x = e.clientX; p.y = e.clientY; moved += Math.abs(dx) + Math.abs(dy);
+  if (ptrs.size === 2 && pinch) {
+    const [a, b] = [...ptrs.values()], r = vp.getBoundingClientRect();
+    zoomAt((a.x + b.x) / 2 - r.left, (a.y + b.y) / 2 - r.top, pinch.s * Math.hypot(a.x - b.x, a.y - b.y) / pinch.d);
+  } else if (zs > 1 && ptrs.size === 1) { zx += dx; zy += dy; applyZoom(); }
+});
+const endPtr = e => {
+  if (!ptrs.delete(e.pointerId)) return;
+  if (ptrs.size < 2) pinch = null;
+  if (e.type === "pointerup" && moved < 8 && ptrs.size === 0) {          // a click or tap; two in a row toggle the zoom
+    const now = performance.now(), r = vp.getBoundingClientRect();
+    if (now - lastTap.t < 320 && Math.hypot(e.clientX - lastTap.x, e.clientY - lastTap.y) < 24) {
+      if (zs > 1) { zs = 1; zx = zy = 0; applyZoom(); } else zoomAt(e.clientX - r.left, e.clientY - r.top, 3);
+      lastTap.t = 0;
+    } else lastTap = {t: now, x: e.clientX, y: e.clientY};
+  }
+};
+["pointerup", "pointercancel"].forEach(n => vp.addEventListener(n, endPtr));
+window.addEventListener("resize", applyZoom);
 
 /* ---------- autoplay ---------- */
 let timer = null;
@@ -2087,7 +2178,7 @@ async function checkForUpdate() {
     if (!nm || !Array.isArray(nm.inits) || !nm.inits.length || keyOf(nm.inits) === keyOf(runs)) return;
     pending = nm;
     const nr = nm.inits[defaultIdx(nm.inits)];
-    $("update").textContent = `New run available · ${fmt(nr.init, {weekday: "short", day: "2-digit", month: "short"})} ${hourZ(nr.init)} — load`;
+    $("update").textContent = `New run · ${fmt(nr.init, {weekday: "short", day: "2-digit", month: "short"})} ${hourZ(nr.init)} · load`;
     $("update").hidden = false;
   } catch (e) { /* offline or mid-deploy: try again later */ }
 }
@@ -2168,7 +2259,7 @@ def build_site(site, entries, args, init, credit_text, nmem, dlat, expected=None
     manifest = {
         "title": "Relative Measure of Predictability", "variable": "500 hPa height",
         "model": "NCEP GEFS", "members": nmem, "grid_deg": round(dlat, 4),
-        "method": "", "credit": credit_text,
+        "method": "RMOP after Toth, Zhu & Marchok (2001)", "credit": credit_text,
         "keep_days": args.keep_days, "latest": ordered[0]["init"],
         "image": {"w": iw, "h": ih, "dpi": args.dpi},
         "colors": [{"class": k, "min": 10 * k, "max": 10 * (k + 1), "color": _hex(RMOP_COLORS[k])}
